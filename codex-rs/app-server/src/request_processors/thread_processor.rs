@@ -3090,9 +3090,14 @@ impl ThreadRequestProcessor {
                 matches!(thread.agent_status().await, AgentStatus::Running),
             );
             let notification = thread_started_notification(started_thread);
-            self.outgoing
-                .send_server_notification(ServerNotification::ThreadStarted(notification))
-                .await;
+            if !connection_ids.is_empty() {
+                self.outgoing
+                    .send_server_notification_to_connections(
+                        connection_ids.as_slice(),
+                        ServerNotification::ThreadStarted(notification),
+                    )
+                    .await;
+            }
         }
 
         for connection_id in connection_ids {
