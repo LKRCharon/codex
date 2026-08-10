@@ -3056,7 +3056,7 @@ impl ThreadRequestProcessor {
         self.thread_watch_manager.subscribe_running_turn_count()
     }
 
-    /// Best-effort: ensure initialized connections are subscribed to this thread.
+    /// Best-effort: announce the thread and ensure initialized connections are subscribed to it.
     pub(crate) async fn try_attach_thread_listener(
         &self,
         thread_id: ThreadId,
@@ -3066,7 +3066,7 @@ impl ThreadRequestProcessor {
         if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
             let config_snapshot = thread.config_snapshot().await;
             self.thread_watch_manager
-                .upsert_thread(&thread_id.to_string())
+                .upsert_thread_silently(&thread_id.to_string())
                 .await;
             if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
                 raw_events_enabled = self
@@ -3077,6 +3077,22 @@ impl ThreadRequestProcessor {
                     .await
                     .experimental_raw_events;
             }
+
+            // Attaching the listener can immediately stream buffered turn and item events. Give
+            // clients the thread metadata first so they can create per-thread state before those
+            // notifications arrive.
+            let mut started_thread =
+                build_thread_from_loaded_snapshot(thread_id, &config_snapshot, thread.as_ref());
+            started_thread.status = resolve_thread_status(
+                self.thread_watch_manager
+                    .loaded_status_for_thread(&started_thread.id)
+                    .await,
+                matches!(thread.agent_status().await, AgentStatus::Running),
+            );
+            let notification = thread_started_notification(started_thread);
+            self.outgoing
+                .send_server_notification(ServerNotification::ThreadStarted(notification))
+                .await;
         }
 
         for connection_id in connection_ids {

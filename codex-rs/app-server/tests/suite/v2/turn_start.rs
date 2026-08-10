@@ -51,6 +51,7 @@ use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::TokenUsageBreakdown;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnEnvironmentParams;
@@ -3273,6 +3274,181 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawned_subagent_is_announced_before_thread_events() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const CHILD_PROMPT: &str = "child: do work";
+    const PARENT_PROMPT: &str = "spawn a child and continue";
+    const SPAWN_CALL_ID: &str = "spawn-call-thread-announcement";
+
+    let server = responses::start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+    }))?;
+    let _parent_turn = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, PARENT_PROMPT),
+        responses::sse(vec![
+            responses::ev_response_created("resp-parent-announcement-1"),
+            responses::ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            responses::ev_completed("resp-parent-announcement-1"),
+        ]),
+    )
+    .await;
+    let _child_turn = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, CHILD_PROMPT),
+        responses::sse(vec![
+            responses::ev_response_created("resp-child-announcement-1"),
+            responses::ev_assistant_message("msg-child-announcement-1", "child done"),
+            responses::ev_completed("resp-child-announcement-1"),
+        ]),
+    )
+    .await;
+    let _parent_follow_up = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-parent-announcement-2"),
+            responses::ev_assistant_message("msg-parent-announcement-2", "parent done"),
+            responses::ev_completed("resp-parent-announcement-2"),
+        ]),
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::MultiAgentV2)
+        .write(codex_home.path())?;
+    write_models_cache(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("gpt-5.4".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: PARENT_PROMPT.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
+    let mut introduced_child_id = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = timeout(remaining, mcp.read_next_message()).await??;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        match notification.method.as_str() {
+            "thread/started" => {
+                let started: ThreadStartedNotification = serde_json::from_value(
+                    notification
+                        .params
+                        .expect("thread/started params must be present"),
+                )?;
+                if started.thread.parent_thread_id.as_deref() == Some(thread.id.as_str()) {
+                    introduced_child_id = Some(started.thread.id);
+                }
+            }
+            "thread/status/changed" => {
+                let thread_id = notification
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .context("thread/status/changed should include threadId")?;
+                if thread_id != thread.id && introduced_child_id.as_deref() != Some(thread_id) {
+                    anyhow::bail!(
+                        "spawned subagent status arrived before thread/started: {thread_id}"
+                    );
+                }
+            }
+            "turn/started" => {
+                let started: TurnStartedNotification = serde_json::from_value(
+                    notification
+                        .params
+                        .expect("turn/started params must be present"),
+                )?;
+                if started.thread_id != thread.id {
+                    assert_eq!(
+                        introduced_child_id.as_deref(),
+                        Some(started.thread_id.as_str()),
+                        "spawned subagent turn arrived before thread/started"
+                    );
+                }
+            }
+            "item/started" => {
+                let started: ItemStartedNotification = serde_json::from_value(
+                    notification
+                        .params
+                        .expect("item/started params must be present"),
+                )?;
+                if started.thread_id != thread.id {
+                    assert_eq!(
+                        introduced_child_id.as_deref(),
+                        Some(started.thread_id.as_str()),
+                        "spawned subagent item arrived before thread/started"
+                    );
+                }
+            }
+            "item/completed" => {
+                let completed: ItemCompletedNotification = serde_json::from_value(
+                    notification
+                        .params
+                        .expect("item/completed params must be present"),
+                )?;
+                if completed.thread_id != thread.id {
+                    assert_eq!(
+                        introduced_child_id.as_deref(),
+                        Some(completed.thread_id.as_str()),
+                        "spawned subagent item completion arrived before thread/started"
+                    );
+                }
+            }
+            "turn/completed" => {
+                let completed: TurnCompletedNotification = serde_json::from_value(
+                    notification
+                        .params
+                        .expect("turn/completed params must be present"),
+                )?;
+                if completed.thread_id != thread.id {
+                    assert_eq!(
+                        introduced_child_id.as_deref(),
+                        Some(completed.thread_id.as_str()),
+                        "spawned subagent turn completion arrived before thread/started"
+                    );
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
 
     Ok(())
 }
